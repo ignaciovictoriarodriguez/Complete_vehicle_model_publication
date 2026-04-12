@@ -54,7 +54,7 @@ If you use this vehicle model in your research, please cite it as:
 
 DOI: 10.5281/zenodo.19535535
 
-[View on Zenodo](https://zenodo.org/records/19535535)
+[[View on Zenodo](https://zenodo.org/records/19535535)](https://doi.org/10.5281/zenodo.19535535)
 ---
 
 ## 3. Architecture & Data Flow
