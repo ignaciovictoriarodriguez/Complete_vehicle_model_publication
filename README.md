@@ -1,3 +1,5 @@
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.19535535.svg)](https://doi.org/10.5281/zenodo.19535535)
+
 ## Table of Contents
 
 1. [Overview](#1-overview)
