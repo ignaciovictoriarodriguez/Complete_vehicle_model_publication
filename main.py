@@ -3466,7 +3466,7 @@ class TractorHead:
         self.lr = self.L - self.lf  # distance from CG to rear axle
         self.track_width = 2.05  # track width in meters
         self.h_cg = 1.15  # height of center of gravity in meters
-        self.mu = 0.9  # tire-road friction coefficient
+        self.mu = DEFAULT_MU  # tire-road friction coefficient (references global for sensitivity studies)
         self.hitch_length = 0.7  # length to trailer hitch point
         self.trailer_drag = 0.0  # CRITICAL: Initialize to prevent undefined behavior
 
@@ -3543,7 +3543,7 @@ class TractorHead:
         # Combined-slip Pacejka tire models (replaces old linear tire models)
         self.tire_front = create_truck_tire('front')
         self.tire_rear = create_truck_tire('rear')
-        self.mu_static = 0.9      # friction coefficient
+        self.mu_static = DEFAULT_MU  # friction coefficient (references global for sensitivity studies)
 
         # Legacy parameters (kept for compatibility but not used in main solver)
         self.B_lat = 12.0
@@ -4242,7 +4242,9 @@ class TractorHead:
         """
         if vx < 1e-3:
             return 0.0
-        max_brake_force = self.mass * self.max_brake_decel
+        # Size tractor brakes to be capable of 0.85g deceleration on its own mass
+        brake_design_mu = 0.85
+        max_brake_force = self.mass * 9.81 * brake_design_mu
         return brake_input * max_brake_force
 
     def distribute_brake_force(self, total_brake_force):
@@ -6319,7 +6321,7 @@ class ArticulatedSegment():
         self.lr = trailer_length/2
         self.track_width = track_width_trailer
         self.h_cg = h_cg_trailer
-        self.mu = 0.9  # tire-road friction coefficient
+        self.mu = DEFAULT_MU  # tire-road friction coefficient (references global for sensitivity studies)
         self.toe=np.radians(0.05) # toe angle in radians
         self.static_camber = np.radians(-0.2)   # trailer static camber
         self.Cgamma = 20000.0                   # camber coefficient trailer [N/rad]
@@ -6584,10 +6586,6 @@ class ArticulatedSegment():
         """
         vx, vy, omega = self.vx, self.vy, self.omega
         
-        # Approximate braking force distribution (50/50 front/rear if front axle exists)
-        # Or better: use simple brake torque model
-        max_brake_torque = 15000.0 * self.r_w # Approx max brake capability
-        
         # Calculate forces
         for tire in self.tire_positions:
             px, py = tire['x'], tire['y']
@@ -6629,7 +6627,11 @@ class ArticulatedSegment():
             brake_eff = brake
             if ENABLE_BRAKE_DELAY and getattr(self, 'brake_system', None) is not None:
                 brake_eff = self.brake_system.update(brake_eff, dt)
-            T_brake = brake_eff * max_brake_torque * (1.0 if axle=='rear' else 0.6)
+            
+            # Brake torque sized to wheel load (pneumatic brake chambers scale with axle rating)
+            brake_design_mu = 0.85
+            max_brake_torque_wheel = Fz * brake_design_mu * self.r_w
+            T_brake = brake_eff * max_brake_torque_wheel
             
             # ABS modulation for trailer wheel-speed integration
             if ENABLE_ABS and self.abs_controller is not None and brake > 0.01:
@@ -7728,7 +7730,20 @@ class CoupledVehicleSystem:
             # Update derived properties (Z, Pitch)
             if hasattr(v, 'waypoints') and v.waypoints is not None:
                 v.z = get_terrain_elevation(v.x, v.y, v.waypoints)
-    
+
+        # Recalculate articulation angles for all follower vehicles
+        # (The solver updates x, y, yaw but does NOT update the derived
+        #  articulation_yaw attribute that KPI extraction relies on.)
+        for i in range(1, self.n_vehicles):
+            leader = self.vehicles[i - 1]
+            follower = self.vehicles[i]
+            new_art = normalize_angle(leader.yaw - follower.yaw)
+            if hasattr(follower, 'prev_articulation_yaw'):
+                follower.articulation_yaw_rate = (
+                    new_art - follower.prev_articulation_yaw) / self.dt
+            follower.articulation_yaw = new_art
+            follower.prev_articulation_yaw = new_art
+
     def compute_residual_individual(self, idx, s_new, s_old, X_new, throttle, brake, steer, dt):
         """Helper to call correct residual function for vehicle type"""
         v = self.vehicles[idx]
