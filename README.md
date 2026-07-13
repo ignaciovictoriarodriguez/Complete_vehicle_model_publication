@@ -21,7 +21,7 @@
 
 ## 1. Overview
 
-`main.py` simulates a **tractor-dolly-semitrailer** articulated vehicle (A-double configuration) navigating a 3-D waypoint track. The simulation is physics-first: every timestep solves a fully-implicit system of coupled nonlinear equations for all vehicle units simultaneously.
+`main.py` simulates a **tractor-dolly-semitrailer** articulated vehicle (A-double configuration) navigating a 3-D waypoint track. The simulation is physics-first: every timestep solves a fully-implicit system of coupled nonlinear equations for all vehicle units simultaneously. LLM Claude Opus 4.5 has been used to debug & restructure the code to streamline it, reduce overhead and improve efficiency. Documentation generated automatically and reviewed by the author.
 
 ### Vehicle Configuration
 
