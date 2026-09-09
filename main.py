@@ -4469,19 +4469,41 @@ class TractorHead:
         Fy = np.clip(Fy_lin, -Fy_max, Fy_max)
         return Fy
 
-    def advance_tire_states(self, state_new, state_old, dt):
+    def advance_tire_states(self, state_new, state_old, dt, delta=None):
         """
         Explicitly update tire relaxation state after solver convergence.
+
+        BUG FIX (see VALIDATION_REPORT.md): this used to fall back on
+        `self.delta`, an attribute that is initialized to 0.0 and never
+        updated anywhere else in the class. As a result, every call computed
+        the front wheels' "steady-state" target force as if the wheel were
+        pointed straight ahead (delta=0), regardless of the actual commanded
+        steering angle. Because this target is what the relaxation filter
+        blends towards each step, the transient tire force history was
+        permanently anchored near the straight-ahead (near-zero slip) force
+        instead of the true steer-dependent steady-state force — capping the
+        vehicle's achievable lateral acceleration to a small fraction of its
+        real tire-limited capability (confirmed empirically: disabling tire
+        relaxation entirely raised steady-state cornering at 30 mph from
+        ~0.15g to ~0.5-0.7g, matching the linear bicycle-model prediction
+        computed from this same tire model's own cornering stiffness).
+        The actual current steering command must now be passed in explicitly
+        by the caller (CoupledVehicleSystem.solve_step passes its `steer`
+        argument); `self.delta` is kept only as a last-resort fallback for
+        any other caller that does not supply it.
         """
         if not ENABLE_TIRE_RELAXATION:
             return
 
+        if delta is None:
+            delta = self.delta
+
         # Unpack states
         rx, ry, ryaw, vx, vy, omega = state_new[0:6]
-        
+
         # Re-compute wheel states at converged solution
         Fz_local = self.compute_wheel_loads_local(vx, vy, omega)
-        wheels = self.compute_wheel_local_states(vx, vy, omega, self.delta, Fz_local)
+        wheels = self.compute_wheel_local_states(vx, vy, omega, delta, Fz_local)
         
         for key, st in wheels.items():
             # Get Steady State forces
@@ -4523,6 +4545,33 @@ class TractorHead:
                 self.Fx_rr_transient_hist, self.Fy_rr_transient_hist = \
                     self.tire_relaxation_rear.compute_transient_forces(
                         Fx_ss, Fy_ss, self.Fx_rr_transient_hist, self.Fy_rr_transient_hist, vx, dt)
+
+    def integrate_roll_dynamics(self, dt):
+        """
+        Explicit roll-DOF integration for use by the monolithic
+        CoupledVehicleSystem solver (see VALIDATION_REPORT.md).
+
+        Mirrors the roll ODE from the legacy standalone `update()` method
+        (mass*ay*h_cg - K_phi*roll - C_phi*roll_rate = Ixx*roll_accel), but is
+        called *after* the translational/yaw state has already been solved
+        for this step, so the true converged lateral acceleration
+        (ay_state + vx*omega, i.e. Fy_total/mass) is available directly
+        instead of the coarser vx*omega-only estimate the legacy path used
+        before its own solve.
+        """
+        ay_true = self.ay + self.vx * self.omega
+        M_roll = self.mass * ay_true * self.h_cg - self.K_phi * self.roll - self.C_phi * self.roll_rate
+        self.roll_rate += (M_roll / self.Ixx) * dt
+        self.roll += self.roll_rate * dt
+
+        # Clamp roll to prevent numerical instability (matches legacy update())
+        self.roll = np.clip(self.roll, -np.radians(15), np.radians(15))
+        self.roll_rate = np.clip(self.roll_rate, -np.radians(60), np.radians(60))
+
+        # Keep dynamic camber consistent with the freshly integrated roll
+        # (same relation used throughout compute_alignment_per_wheel)
+        self.camber_front_total = self.static_camber_front + self.camber_gain * self.roll
+        self.camber_rear_total = self.static_camber_rear + self.camber_gain * self.roll
 
     def pneumatic_trail(self, alpha):
         # decays with |alpha|
@@ -6706,6 +6755,30 @@ class ArticulatedSegment():
                 vx, dt
             )
 
+    def integrate_roll_dynamics(self, dt):
+        """
+        Explicit roll-DOF integration for use by the monolithic
+        CoupledVehicleSystem solver (see VALIDATION_REPORT.md).
+
+        Mirrors the roll ODE already used by the legacy standalone `update()`
+        method below, but is called after the translational/yaw state has
+        already been solved for this step, so the true converged lateral
+        acceleration (ay_state + vx*omega, i.e. Fy_total/mass) is available
+        directly instead of the vx*omega-only estimate the legacy path uses
+        before its own solve. Without this, `.roll`/`.roll_rate` never move
+        from their initial value when a trailer is driven through
+        CoupledVehicleSystem.solve_step(), which silently zeroes out any
+        roll-based metric (e.g. UMTRI's Last Trailer Roll Gain).
+        """
+        ay_true = self.ay + self.vx * self.omega
+        M_roll = self.mass * ay_true * self.h_cg - self.K_phi * self.roll - self.C_phi * self.roll_rate
+        self.roll_rate += (M_roll / self.Ixx) * dt
+        self.roll += self.roll_rate * dt
+
+        # Clamp roll (trailers can roll more than tractors) — matches legacy update()
+        self.roll = np.clip(self.roll, -np.radians(12), np.radians(12))
+        self.roll_rate = np.clip(self.roll_rate, -np.radians(60), np.radians(60))
+
     def update(self, leader_x, leader_y, leader_z, leader_yaw, leader_pitch, leader_vx, leader_vy, leader_yaw_rate, leader_steer, dt, follower_info=None):
         """Update trailer state using implicit Euler with Newton-Raphson solver.
         
@@ -8021,7 +8094,7 @@ class CoupledVehicleSystem:
             
         if converged:
              self.unpack_and_update(X_new)
-             
+
              # ADVANCE TIRE RELAXATION STATES (History Update)
              # Now that we have a converged solution, update the history terms for next step
              for i, vehicle in enumerate(self.vehicles):
@@ -8029,8 +8102,18 @@ class CoupledVehicleSystem:
                  s_new = X_new[idx : idx + 9]
                  s_old = X_old[idx : idx + 9]
                  if hasattr(vehicle, 'advance_tire_states'):
-                     vehicle.advance_tire_states(s_new, s_old, dt)
-             
+                     # BUG FIX: the tractor (i==0) is the only vehicle whose front
+                     # wheels are actually steered by `steer`; it must be passed
+                     # explicitly here or TractorHead.advance_tire_states silently
+                     # falls back to a dead `self.delta` attribute that is always
+                     # 0.0 (see the fix note in that method). Followers ignore the
+                     # extra argument entirely (their own steering, if any, comes
+                     # from articulation geometry, not this system-wide `steer`).
+                     if i == 0:
+                         vehicle.advance_tire_states(s_new, s_old, dt, delta=steer)
+                     else:
+                         vehicle.advance_tire_states(s_new, s_old, dt)
+
              # Add sample to Tractor's Koopman (for online learning)
              if hasattr(self.vehicles[0], 'koopman'):
                  self.vehicles[0].koopman.add_sample(X_old[0:9], X_new[0:9])
@@ -8038,7 +8121,29 @@ class CoupledVehicleSystem:
              if self.dt > 1e-4:
                  print(f"WARN: Monolithic solver not converged. Res: {res_norm:.2e} EnergyErr: {avg_energy_error:.2e}")
              self.unpack_and_update(X_new)
-             
+
+        # ====================================================================
+        # ROLL DYNAMICS (explicit, decoupled integration — see VALIDATION_REPORT.md)
+        # ====================================================================
+        # The 9-state monolithic residual/Jacobian above solves only
+        # [x, y, yaw, vx, vy, omega, ax, ay, alpha] — roll is not one of the
+        # implicitly-coupled DOFs. Previously this meant `.roll`/`.roll_rate`
+        # stayed frozen at their initial values (usually 0.0) forever whenever
+        # a vehicle was driven through this monolithic solve_step() path,
+        # even though the exact same roll ODE was already implemented (and
+        # used) by the legacy standalone TractorHead.update()/
+        # ArticulatedSegment.update() methods. This silently disabled every
+        # roll-dependent effect (camber-induced tire force, RSC's rollover
+        # detection, and any roll-based KPI such as UMTRI's Last Trailer Roll
+        # Gain). Integrating it here — explicitly, after the translational/yaw
+        # state has already been solved — mirrors the legacy formula and uses
+        # the just-converged (or best-effort) state, so it feeds correctly
+        # into next step's camber/load-transfer calculations without changing
+        # the size or structure of the monolithic Newton-Raphson system.
+        for vehicle in self.vehicles:
+            if hasattr(vehicle, 'integrate_roll_dynamics'):
+                vehicle.integrate_roll_dynamics(dt)
+
         return converged
 
 
